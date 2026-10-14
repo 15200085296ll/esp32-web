@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 对话</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; background: #f0f0f0;
+         display: flex; flex-direction: column; }
+  #status { padding:6px 10px; background:#333; color:#0f0; font-size:12px; }
+  #status.off { color:#f66; }
+  #chat { flex:1; overflow-y:auto; padding:10px; background:#fff; }
+  .msg { margin:6px 0; padding:8px 12px; border-radius:12px;
+         max-width:78%; word-wrap:break-word; font-size:15px; }
+  .me  { background:#007bff; color:#fff; margin-left:auto; }
+  .esp { background:#e0e0e0; color:#000; }
+  .sys { background:#fff3cd; color:#856404; font-size:12px;
+         text-align:center; margin:6px auto; max-width:90%; }
+  #input-area { padding:10px; background:#fafafa; display:flex; gap:8px;
+                flex-shrink:0; border-top:1px solid #e0e0e0; }
+  #msg { flex:1; padding:10px 14px; border:1px solid #ccc;
+         border-radius:20px; font-size:16px; outline:none; }
+  button { padding:10px 16px; border:none; border-radius:20px;
+           font-size:16px; background:#007bff; color:#fff; }
+  button:active { background:#0056b3; }
+  #rec-btn { background:#dc3545; }
+  #rec-btn.recording { background:#28a745; }
+</style>
+</head>
+<body>
+<div id="status" class="off">MQTT 未连接</div>
+<div id="chat"></div>
+<div id="input-area">
+  <input id="msg" placeholder="输入消息..." autocomplete="off">
+  <button onclick="send()">发送</button>
+  <button id="rec-btn" onclick="toggleRec()">🎤</button>
+</div>
+
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script>
+// ========== EMQX Cloud 配置 ==========
+const MQTT_HOST     = 'k396ac33.ala.cn-hangzhou.emqxsl.cn';
+const MQTT_PORT_WSS = 8084;
+const MQTT_USER     = 'esp32';
+const MQTT_PASS     = 'esp32pass123';
+const TOPIC_TO_ESP  = 'esp32/from_phone';   // 手机→ESP32
+const TOPIC_FROM_ESP= 'esp32/to_phone';     // ESP32→手机
+
+const chat = document.getElementById('chat');
+const input = document.getElementById('msg');
+const recBtn = document.getElementById('rec-btn');
+const statusEl = document.getElementById('status');
+let client, rec, recognizing=false;
+
+if ('Notification' in window && Notification.permission === 'default') {
+  Notification.requestPermission();
+}
+
+function beep() {
+  if (navigator.vibrate) navigator.vibrate([100, 60, 100]);
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try {
+      const n = new Notification('ESP32 消息', {
+        body: '收到新消息', tag:'esp32-msg', silent:true
+      });
+      setTimeout(()=>n.close(), 1500);
+    } catch(e) {}
+  }
+  try {
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    [0,0.15].forEach(t=>{
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.frequency.value = 1200;
+      g.gain.value = 0.15;
+      osc.connect(g).connect(ctx.destination);
+      osc.start(ctx.currentTime+t);
+      osc.stop(ctx.currentTime+t+0.08);
+    });
+  } catch(e) {}
+}
+
+function addMsg(text, cls, notify) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+  if (notify && cls === 'esp') beep();
+}
+function addSys(text) {
+  const d = document.createElement('div');
+  d.className = 'sys';
+  d.textContent = text;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+// ========== MQTT 连接 ==========
+function connectMQTT() {
+  const clientId = 'web-' + Math.random().toString(16).substr(2, 10);
+  const url = `wss://${MQTT_HOST}:${MQTT_PORT_WSS}/mqtt`;
+
+  addSys('正在连接 EMQX...');
+  client = mqtt.connect(url, {
+    clientId: clientId,
+    username: MQTT_USER,
+    password: MQTT_PASS,
+    clean: true,
+    reconnectPeriod: 3000,
+    connectTimeout: 10000
+  });
+
+  client.on('connect', () => {
+    statusEl.textContent = 'MQTT 已连接';
+    statusEl.classList.remove('off');
+    addSys('已连接到 EMQX');
+    client.subscribe(TOPIC_FROM_ESP, { qos: 0 }, (err) => {
+      if (!err) addSys('已订阅 ' + TOPIC_FROM_ESP);
+    });
+  });
+
+  client.on('reconnect', () => {
+    statusEl.textContent = 'MQTT 重连中...';
+    statusEl.classList.add('off');
+  });
+
+  client.on('close', () => {
+    statusEl.textContent = 'MQTT 已断开';
+    statusEl.classList.add('off');
+  });
+
+  client.on('error', (err) => {
+    addSys('MQTT 错误: ' + err.message);
+  });
+
+  client.on('message', (topic, payload) => {
+    const raw = payload.toString();
+    // 格式：type|text
+    const idx = raw.indexOf('|');
+    if (idx > 0) {
+      const type = raw.substring(0, idx);
+      const text = raw.substring(idx + 1);
+      addMsg(text, type, true);
+    } else {
+      addMsg(raw, 'esp', true);
+    }
+  });
+}
+connectMQTT();
+
+// ========== 发送 ==========
+function send() {
+  const t = input.value.trim();
+  if (!t || !client || !client.connected) return;
+  client.publish(TOPIC_TO_ESP, t);
+  addMsg(t, 'me', false);
+  input.value = '';
+}
+input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+// ========== 语音识别 ==========
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (SR) {
+  rec = new SR();
+  rec.lang = 'zh-CN';
+  rec.continuous = false;
+  rec.interimResults = false;
+  rec.onresult = e => { input.value = e.results[0][0].transcript; send(); };
+  rec.onend = () => { recognizing = false; recBtn.classList.remove('recording'); };
+  rec.onerror = e => addSys('识别错误: ' + e.error);
+} else {
+  recBtn.disabled = true;
+  recBtn.textContent = '无语音';
+}
+function toggleRec() {
+  if (!rec) return;
+  if (recognizing) rec.stop();
+  else { rec.start(); recognizing = true; recBtn.classList.add('recording'); }
+}
+</script>
+</body>
+</html>
